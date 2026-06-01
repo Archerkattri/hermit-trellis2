@@ -1,0 +1,26 @@
+faster-trellis2
+Copyright (c) 2026 Krishi Attri <krishiattriwork@gmail.com>
+https://github.com/Archerkattri
+
+This product bundles and builds upon the following MIT-licensed work:
+
+  TRELLIS.2 (microsoft/TRELLIS.2)
+  Copyright (c) Microsoft Corporation.
+  https://github.com/microsoft/TRELLIS
+  The image-to-3D pipeline, models, decoders, and o-voxel are unmodified
+  Microsoft code, redistributed under the MIT License (see LICENSE).
+
+The training-free acceleration added by this project re-implements two
+published, training-free inference methods (no upstream code reused):
+
+  HiCache: Training-free Acceleration of Diffusion Models via Hermite
+  Polynomial Feature Forecasting. arXiv:2508.16984.
+
+  Adaptive Guidance: Training-free Acceleration of Conditional Diffusion
+  Models. Castillo et al., arXiv:2312.12487.
+
+Our additions (samplers/hicache.py, samplers/adaptive_cfg.py, the accelerated
+sampler classes in samplers/flow_euler.py, the enable_faster() API, the example
+and benchmark scripts) are Copyright (c) 2026 Krishi Attri, MIT License.
+
+This project contains NO Fast-TRELLIS code.
