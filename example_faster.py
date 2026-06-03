@@ -1,31 +1,28 @@
 #!/usr/bin/env python3
-"""faster-trellis2: TRELLIS.2-4B + training-free acceleration (HiCache + adaptive_cfg).
+"""hermit-trellis2: TRELLIS.2-4B + the training-free Hermite carved-hybrid (Hermite SS forecast + token-carved SLaT).
 
 Minimal image->3D example showing how to enable the acceleration. The pipeline is
-the full, unpruned TRELLIS.2 (mesh + texture + 1024_cascade); only the per-step
-diffusion compute is reduced.
+the full TRELLIS.2 (mesh + texture + 1024_cascade); only the per-step diffusion
+compute is reduced.
 
 Acceleration is one call::
 
-    pipeline.enable_faster("hicache")      # DEFAULT: Hermite velocity forecast,
-                                           #   robust (n=20, 0 failures), 1.86x
-    pipeline.enable_faster("full_stack")   # opt-in: + adaptive_cfg on SLaT stages,
-                                           #   1.89x but see empty-mesh caveat
-    pipeline.enable_faster("adaptive_cfg") # skip the uncond CFG pass only
-    pipeline.enable_faster("vanilla")      # restore stock samplers
+    pipeline.enable_faster()         # the Hermite carved-hybrid (default), lossless vs base
+    pipeline.enable_faster("base")   # standard TRELLIS.2 samplers (kill-switch)
 
-Blackwell (RTX 5090 / sm_120) environment, run as::
+Example invocation with the recommended sparse-conv / attention backends::
 
     SPARSE_CONV_BACKEND=spconv SPCONV_ALGO=native ATTN_BACKEND=flash_attn \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-    LD_LIBRARY_PATH=/tmp/ssl11:$LD_LIBRARY_PATH CUDA_VISIBLE_DEVICES=0 \
+    CUDA_VISIBLE_DEVICES=0 \
     <trellis2-venv>/python example_faster.py --image <rgba.png>
 """
 import argparse, os, sys, types
 
 
 def _stub_render_deps():
-    # decode_latent lazily imports these render-only deps; stub if absent.
+    # decode_latent lazily imports these render-only dependencies; this example
+    # only needs the mesh geometry, so provide empty module placeholders for them.
     for m in ("nvdiffrast", "nvdiffrast.torch", "nvdiffrec"):
         sys.modules.setdefault(m, types.ModuleType(m))
     sys.modules["nvdiffrast"].torch = sys.modules["nvdiffrast.torch"]
@@ -35,12 +32,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="ckpts/TRELLIS.2-4B")
     ap.add_argument("--image", required=True, help="RGBA PNG (alpha = object mask)")
-    ap.add_argument("--mode", default="hicache",
-                    choices=["hicache", "full_stack", "adaptive_cfg", "vanilla"])
+    ap.add_argument("--mode", default="hermite",
+                    choices=["hermite", "base"])
     ap.add_argument("--pipeline-type", default="1024_cascade",
                     choices=["512", "1024", "1024_cascade", "1536_cascade"])
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--out", default="faster_trellis2_out.glb")
+    ap.add_argument("--out", default="hermit_trellis2_out.glb")
     args = ap.parse_args()
 
     _stub_render_deps()

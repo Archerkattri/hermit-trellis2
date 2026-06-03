@@ -209,39 +209,29 @@ class FlowEulerGuidanceIntervalSampler(GuidanceIntervalSamplerMixin, ClassifierF
 
 
 # ===========================================================================
-# Training-free acceleration for TRELLIS.2 (publishable, faithful to cited
-# methods). Two composable, training-free accelerations on the *final
-# velocity* substrate:
+# Training-free acceleration for TRELLIS.2. Two composable accelerations that
+# act on the *final velocity* substrate:
 #
 #   * HiCache (arXiv:2508.16984) -- Hermite-polynomial forecast of the final
-#     CFG-combined velocity at skipped sampling steps. Replaces the TaylorSeer
-#     monomial basis with the dual-scaled physicist's Hermite basis (same
-#     final-velocity substrate as Fast-TRELLIS). Skips whole model evaluations.
+#     CFG-combined velocity at skipped sampling steps, using a dual-scaled
+#     physicist's Hermite basis. Skips whole model evaluations.
 #
 #   * adaptive_cfg (Adaptive Guidance, arXiv:2312.12487) -- on CFG steps, skip
 #     the *unconditional* forward pass once cond/uncond predictions align
 #     (cosine sim >= gamma_bar), reconstructing the guidance term from cached
 #     anchors. Halves the per-compute-step CFG cost on aligned steps.
 #
-# SS-stage robustness note (empty-mesh finding):
-#   In the wide bench, stacking adaptive_cfg onto the sparse-structure (SS)
-#   stage emptied 3/20 rounded objects: the uncond pass is what holds the coarse
-#   occupancy volume open, and skipping it over-carves rounded silhouettes to
-#   nothing. The fix lives in the pipeline (enable_faster): full_stack confines
-#   adaptive_cfg to the SLaT stages and runs the SS stage HiCache-only, so the
-#   _faster sampler below is only ever wired to the SLaT stages. HiCache alone
-#   (the default) never skips an uncond pass and had 0 failures (n=20).
+# Sparse-structure vs SLaT stages:
+#   adaptive_cfg is applied only to the SLaT stages; the sparse-structure (SS)
+#   stage keeps the unconditional pass, which shapes the coarse occupancy
+#   volume. The _faster sampler below is wired to the SLaT stages by the
+#   pipeline (enable_faster), while the SS stage runs the HiCache-only sampler.
+#   The default HiCache mode never skips an unconditional pass on any stage.
 #
-# v1 -> v2 API adaptations (the only changes vs the faster_components/*.py
-# reference implementations):
-#   * cfg_strength/cfg_interval        -> guidance_strength/guidance_interval
-#   * single CFG-in-interval mixin     -> v2 split MRO
-#                                         (GuidanceIntervalSamplerMixin,
-#                                          ClassifierFreeGuidanceSamplerMixin, base)
-#   * extra v2 kwargs (guidance_rescale, concat_cond, tqdm_desc) flow through
-#   * SS pred_v is a dense tensor; SLaT pred_v is a SparseTensor -- HiCache
-#     forecasts .feats only and rebuilds via .replace(feats).
-# No silent fallbacks, no placeholders, full mesh+texture+1024_cascade support.
+# Stage tensor types:
+#   The SS stage pred_v is a dense tensor; the SLaT stages pred_v is a
+#   SparseTensor, so HiCache forecasts .feats only and rebuilds the tensor via
+#   .replace(feats). Full mesh + texture + 1024_cascade support throughout.
 # ===========================================================================
 
 from .hicache import (
@@ -249,12 +239,13 @@ from .hicache import (
     hicache_decide,
     hicache_update_derivatives,
     hicache_forecast,
+    hicache_calibrate,
+    hicache_record_compute,
+    hicache_freq_blend,
 )
 from . import adaptive_cfg as _acfg
-
-
-def _is_sparse(x: Any) -> bool:
-    return hasattr(x, "feats") and hasattr(x, "replace")
+# Single sparse-tensor predicate, shared with AdaptiveCFGMixin (no duplicate).
+from .adaptive_cfg import is_sparse as _is_sparse
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +264,54 @@ class HiCacheMixin:
     hicache_first_enhance: int = 2
     hicache_sigma: float = 0.5
 
+    # --- improvement toggles (all default-OFF so shipped behaviour is unchanged) ---
+    # (2) higher-order forecast: hicache_max_order in {1,2,3}; when
+    # hicache_order_sigma_retune is on, sigma is auto-lowered for order>=2 so the
+    # higher Hermite terms stay in the stable contracted regime.
+    hicache_order_sigma_retune: bool = False
+    # (1) FoCa-style Heun calibration of the forecast.
+    hicache_calibrate: bool = False
+    hicache_calibrate_weight: float = 0.5
+    # (3) confidence-gated adaptive skip schedule.
+    hicache_adaptive_schedule: bool = False
+    hicache_interval_min: int = 2
+    hicache_interval_max: int = 5
+    hicache_adaptive_tol: float = 0.05
+    # (5) frequency-aware per-token forecast selectivity.
+    hicache_freq_carve: bool = False
+    hicache_freq_strength: float = 0.8
+    # per-token high-frequency weight (N,) injected from the SS stage; None=off.
+    _hicache_freq_weight = None
+
+    def set_freq_weight(self, freq_weight) -> None:
+        """Inject the SS-stage per-token high-frequency weight (N,) in [0,1].
+
+        Mirrors fast-trellis2's ``set_coords_scores``: the pipeline computes a
+        3D-FFT high-frequency score per occupied voxel and hands it to the SLaT
+        sampler, where ``hicache_freq_carve`` uses it to blend high-frequency
+        tokens' forecasts back toward the last computed anchor. Auto-disabled
+        (shape mismatch / None) on the cascade-upsample and texture stages where
+        the token coordinates are re-derived -- exactly as the original did.
+        """
+        self._hicache_freq_weight = freq_weight
+
+    def _release_accel_state(self) -> None:
+        """Drop the HiCache derivative cache (CUDA tensors) and free memory.
+
+        Cooperative: chains to any sibling acceleration mixin's
+        ``_release_accel_state`` (e.g. AdaptiveCFGMixin in the full_stack
+        sampler) before emptying the CUDA cache once. The state is rebuilt fresh
+        by ``_hicache_setup`` at the start of every run, so this does not affect
+        the output.
+        """
+        self._hicache = None
+        self._hicache_freq_weight = None
+        parent = getattr(super(), "_release_accel_state", None)
+        if callable(parent):
+            parent()
+        elif torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def _hicache_setup(self, steps: int) -> None:
         # TRELLIS.2 runs short schedules (12 steps). Keep a few warm-up full
         # steps and always make the final step full; shrink the interval for
@@ -280,16 +319,37 @@ class HiCacheMixin:
         first_enhance = self.hicache_first_enhance
         end_enhance = steps - 1            # last step always full
         interval = self.hicache_interval
+        imin = self.hicache_interval_min
+        imax = self.hicache_interval_max
         if steps < 20:
             first_enhance = max(2, min(first_enhance, round(steps / 3.0)))
-            interval = min(interval, 3)
+            # The <20-step interval clamp is the conservative default; when the
+            # calibrate/adaptive toggles are on we trust longer forecast runs,
+            # so the clamp only applies to the plain (uncalibrated, fixed) path.
+            relaxed = self.hicache_calibrate or self.hicache_adaptive_schedule
+            if not relaxed:
+                interval = min(interval, 3)
+            imax = min(imax, max(interval, 3) + 2)
+            imin = max(min(imin, interval), 1)
+        # (2) order<->sigma interaction: raising the forecast order pairs with a
+        # lower contraction sigma so the high-order Hermite terms stay damped
+        # (each extra order multiplies sigma by 0.7: order2 -> 0.35*base,
+        # order3 -> ~0.245*base), floored at 0.15.
+        sigma = self.hicache_sigma
+        if self.hicache_order_sigma_retune and self.hicache_max_order >= 2:
+            sigma = sigma * (0.7 ** (self.hicache_max_order - 1))
+            sigma = max(sigma, 0.15)
         self._hicache = hicache_init(
             num_steps=steps,
             interval=interval,
             max_order=self.hicache_max_order,
             first_enhance=first_enhance,
             end_enhance=end_enhance,
-            sigma=self.hicache_sigma,
+            sigma=sigma,
+            adaptive=self.hicache_adaptive_schedule,
+            interval_min=imin,
+            interval_max=imax,
+            adaptive_tol=self.hicache_adaptive_tol,
         )
 
     @torch.no_grad()
@@ -301,21 +361,48 @@ class HiCacheMixin:
         decision = hicache_decide(state)
 
         if decision == "full":
-            pred_x_0, pred_eps, pred_v = self._get_model_prediction(model, x_t, t, cond, **kwargs)
+            # eps branch is unused on this path; take x_0 and v only.
+            pred_x_0, _, pred_v = self._get_model_prediction(model, x_t, t, cond, **kwargs)
             feats = pred_v.feats if _is_sparse(pred_v) else pred_v
-            hicache_update_derivatives(state, feats.detach().clone())
+            feats = feats.detach().clone()
+            # (3) adaptive schedule: probe the forecast error at this compute
+            # step BEFORE overwriting the derivative cache, so the next skip run
+            # is gated on how well the forecaster is currently tracking. Reuses
+            # the existing cache only -- no network evaluation.
+            if state.get("adaptive"):
+                hicache_record_compute(state, feats)
+            hicache_update_derivatives(state, feats)
             state["step"] += 1
             pred_x_prev = x_t - (t - t_prev) * pred_v
             return edict({"pred_x_prev": pred_x_prev, "pred_x_0": pred_x_0})
 
         # forecast step: rebuild the final velocity from cached derivatives,
-        # no model evaluation at all.
+        # no model evaluation at all. Only x_0 is needed downstream, so compute
+        # it directly (avoids recomputing the discarded eps branch on the
+        # SparseTensor each forecast step). Numerically identical to
+        # _v_to_xstart_eps(...)[0].
         feats_hat = hicache_forecast(state)
+        # (1) FoCa-style Heun calibration: shrink the over-confident forecast
+        # toward the last trusted anchor (reuses cached derivatives; zero evals).
+        if self.hicache_calibrate:
+            feats_hat = hicache_calibrate(state, feats_hat, self.hicache_calibrate_weight)
+        # (5) frequency-aware selectivity: pull high-frequency tokens' forecasts
+        # back toward the last computed anchor. Auto-disabled when no SS-stage
+        # weight is present or its length does not match the current tokens (the
+        # cascade-upsample / texture stages, where coords are re-derived).
+        fw = self._hicache_freq_weight
+        if self.hicache_freq_carve and fw is not None:
+            anchor = state["derivatives"].get(0)
+            if (anchor is not None and feats_hat.dim() == 2
+                    and fw.shape[0] == feats_hat.shape[0]):
+                fw = fw.to(feats_hat.device, feats_hat.dtype)
+                feats_hat = hicache_freq_blend(
+                    feats_hat, anchor, fw, self.hicache_freq_strength)
         if _is_sparse(x_t):
             pred_v = x_t.replace(feats_hat)
         else:
             pred_v = feats_hat
-        pred_x_0, _eps = self._v_to_xstart_eps(x_t=x_t, t=t, v=pred_v)
+        pred_x_0 = self._pred_to_xstart(x_t, t, pred_v)
         pred_x_prev = x_t - (t - t_prev) * pred_v
         state["step"] += 1
         return edict({"pred_x_prev": pred_x_prev, "pred_x_0": pred_x_0})
@@ -342,16 +429,34 @@ class AdaptiveCFGMixin:
     acfg_warmup: int = 2
     acfg_max_order: int = 1
     acfg_reuse_guidance: bool = True
+    # (6) adaptive-CFG upgrade toggles (default-OFF).
+    acfg_hermite: bool = False                 # Hermite (+calibrate) guidance forecast
+    acfg_hermite_sigma: float = 0.5
+    acfg_hermite_calibrate_weight: float = 0.0
+    acfg_gamma_bar_schedule: bool = False      # schedule-adaptive gamma_bar
 
     def _acfg_reset(self, steps: int) -> None:
         self._acfg_state = None
         self._acfg_steps = int(steps)
 
+    def _release_accel_state(self) -> None:
+        """Drop the adaptive_cfg guidance-anchor state (CUDA tensors) and free
+        memory. Cooperative: chains to any sibling acceleration mixin's
+        ``_release_accel_state`` before emptying the CUDA cache once. The state
+        is rebuilt fresh by ``_acfg_reset`` each run, so the output is unchanged.
+        """
+        self._acfg_state = None
+        parent = getattr(super(), "_release_accel_state", None)
+        if callable(parent):
+            parent()
+        elif torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def _inference_model(self, model, x_t, t, cond, neg_cond,
                          guidance_strength, guidance_rescale=0.0, **kwargs):
         # No CFG requested (e.g. tex stage guidance_strength=1, or the
-        # outside-interval path): single conditional/uncond pass, no caching,
-        # no counter advance -- identical to the stock mixin.
+        # outside-interval path): single conditional/unconditional pass, no
+        # caching and no counter advance, matching the standard CFG mixin.
         if guidance_strength == 1:
             return super(ClassifierFreeGuidanceSamplerMixin, self)._inference_model(
                 model, x_t, t, cond, **kwargs)
@@ -367,6 +472,10 @@ class AdaptiveCFGMixin:
                 warmup=self.acfg_warmup,
                 max_order=self.acfg_max_order,
                 reuse_guidance=self.acfg_reuse_guidance,
+                hermite=self.acfg_hermite,
+                hermite_sigma=self.acfg_hermite_sigma,
+                hermite_calibrate_weight=self.acfg_hermite_calibrate_weight,
+                gamma_bar_schedule=self.acfg_gamma_bar_schedule,
             )
             self._acfg_state = state
 
@@ -391,8 +500,14 @@ class AdaptiveCFGMixin:
             state["n_full"] += 1
         else:
             if state["reuse_guidance"]:
-                g = _acfg.forecast_guidance(
-                    state["anchors"], state["step"], state["max_order"])
+                if state.get("hermite"):
+                    g = _acfg.forecast_guidance_hermite(
+                        state["anchors"], state["step"], state["max_order"],
+                        sigma=state["hermite_sigma"],
+                        calibrate_weight=state["hermite_calibrate_weight"])
+                else:
+                    g = _acfg.forecast_guidance(
+                        state["anchors"], state["step"], state["max_order"])
                 pred = _acfg.with_payload(pred_pos, _acfg.payload(pred_pos) + g)
             else:
                 pred = pred_pos
@@ -445,7 +560,10 @@ class FlowEulerGuidanceIntervalSampler_hicache(
             if verbose:
                 print(f"[hicache] full steps: {n_full}/{steps} "
                       f"(forecast {steps - n_full})")
-            self._hicache = None
+            # Release the cached-derivative CUDA tensors held by the HiCache
+            # state at the end of every run. The state is rebuilt fresh on the
+            # next run, so the output is unchanged.
+            self._release_accel_state()
         return ret
 
 
@@ -463,14 +581,19 @@ class FlowEulerGuidanceIntervalSampler_adaptivecfg(
                guidance_interval: Tuple[float, float] = (0.0, 1.0),
                verbose: bool = True, **kwargs):
         self._acfg_reset(steps)
-        ret = super().sample(
-            model, noise, cond, steps, rescale_t, verbose,
-            neg_cond=neg_cond, guidance_strength=guidance_strength,
-            guidance_interval=guidance_interval, **kwargs)
-        st = getattr(self, "_acfg_state", None)
-        if verbose and st is not None:
-            print(f"[adaptive-cfg] full CFG: {st['n_full']}, "
-                  f"uncond-skipped: {st['n_skip']}")
+        try:
+            ret = super().sample(
+                model, noise, cond, steps, rescale_t, verbose,
+                neg_cond=neg_cond, guidance_strength=guidance_strength,
+                guidance_interval=guidance_interval, **kwargs)
+            st = getattr(self, "_acfg_state", None)
+            if verbose and st is not None:
+                print(f"[adaptive-cfg] full CFG: {st['n_full']}, "
+                      f"uncond-skipped: {st['n_skip']}")
+        finally:
+            # Release the guidance-anchor CUDA tensors held in _acfg_state at the
+            # end of every run. The anchors are rebuilt on the next run's reset.
+            self._release_accel_state()
         return ret
 
 
@@ -481,7 +604,7 @@ class FlowEulerGuidanceIntervalSampler_faster(
         ClassifierFreeGuidanceSamplerMixin,
         FlowEulerSampler):
     """full_stack: HiCache (velocity forecast on skip steps) + adaptive_cfg
-    (uncond-pass skip on aligned compute steps). The default "faster" mode.
+    (unconditional-pass skip on aligned compute steps).
 
     Composition: HiCache decides compute vs forecast in ``sample_once``. On a
     compute step ``_get_model_prediction`` runs, which resolves through the
@@ -511,5 +634,7 @@ class FlowEulerGuidanceIntervalSampler_faster(
                     msg += (f" | adaptive-cfg full: {st['n_full']}, "
                             f"uncond-skipped: {st['n_skip']}")
                 print(msg)
-            self._hicache = None
+            # Release both the HiCache derivative cache and the adaptive_cfg
+            # guidance anchors (both hold CUDA tensors) at the end of the run.
+            self._release_accel_state()
         return ret

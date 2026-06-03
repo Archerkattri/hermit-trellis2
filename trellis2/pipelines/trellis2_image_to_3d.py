@@ -1,10 +1,13 @@
 from typing import *
+import os
+import json
 import torch
 import torch.nn as nn
 import numpy as np
 from PIL import Image
 from .base import Pipeline
 from . import samplers, rembg
+from .samplers.hicache_freq import ss_high_freq_weight
 from ..modules.sparse import SparseTensor
 from ..modules import image_feature_extractor
 from ..representations import Mesh, MeshWithVoxel
@@ -102,9 +105,10 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         pipeline.tex_slat_normalization = args['tex_slat_normalization']
 
         pipeline.image_cond_model = getattr(image_feature_extractor, args['image_cond_model']['name'])(**args['image_cond_model']['args'])
-        # rembg is only used by preprocess_image(); for pre-masked inputs (our
-        # benchmark) it is optional and its native deps may be unavailable on
-        # this Blackwell setup, so degrade gracefully instead of failing import.
+        # rembg is only used by preprocess_image() for background removal. It is
+        # optional: with pre-masked RGBA inputs the pipeline never calls it, so if
+        # its native dependencies are unavailable the model is left unset and
+        # construction proceeds.
         try:
             pipeline.rembg_model = getattr(rembg, args['rembg_model']['name'])(**args['rembg_model']['args'])
         except Exception as _rembg_exc:
@@ -131,85 +135,110 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             if self.rembg_model is not None:
                 self.rembg_model.to(device)
 
-    def enable_faster(self, mode: str = "hicache") -> "Trellis2ImageTo3DPipeline":
-        """Enable training-free inference acceleration in place.
+    def enable_faster(self, mode: str = "hermite") -> "Trellis2ImageTo3DPipeline":
+        """Enable the Hermite carved-hybrid acceleration in place — a HiCache (Hermite)
+        sparse-structure forecast over the token-carved SLaT sampler (delta-cache temporal
+        skip + spatial token carving). One shipped configuration; ``"base"`` / ``None`` is
+        the kill-switch (stock TRELLIS.2 samplers).
 
-        Swaps the sparse-structure / shape-SLaT / texture-SLaT samplers for the
-        accelerated variants while preserving their sampler *params* (steps,
-        guidance, etc.). Full mesh + texture + 1024_cascade functionality is
-        unchanged; only the per-step compute is reduced.
-
-        Modes
-        -----
-        ``"hicache"`` / ``"faster"`` (DEFAULT, robust):
-            HiCache only -- Hermite forecast of the final velocity on skipped
-            steps. n=20 wide bench: 0 failures, 1.86x, near-vanilla quality.
-            This is the safe default for arbitrary objects.
-        ``"full_stack"`` (opt-in, max-quality on well-posed objects):
-            HiCache on every stage + adaptive_cfg on the SLaT stages ONLY.
-            1.89x and best vIoU on objects with clear silhouettes, BUT see the
-            empty-mesh caveat below.
-        ``"adaptive_cfg"``: adaptive_cfg only (SLaT stages effectively).
-        ``"vanilla"`` / ``None``: restore the stock guidance-interval samplers.
-
-        SS-stage robustness (the empty-mesh fix)
-        ----------------------------------------
-        In the wide bench, ``full_stack`` produced EMPTY meshes on 3/20 rounded
-        objects (ball, bowl, chicken). Root cause: adaptive_cfg skips the
-        unconditional pass once cond/uncond align, but on the *sparse-structure*
-        (SS) stage that uncond pass is what keeps the coarse occupancy volume
-        from collapsing -- dropping it over-carves rounded silhouettes to empty.
-        The SLaT stages (which refine an already-decided structure) do not show
-        this failure.
-
-        Minimal safe fix applied here: even in ``full_stack`` the SS stage uses
-        the HiCache-ONLY sampler (never adaptive_cfg). adaptive_cfg is confined
-        to the two SLaT stages, where it is stable. This keeps HiCache's SS
-        speedup while removing the empty-mesh mechanism. ``hicache`` (the
-        default) never touches adaptive_cfg at all, so it was always robust.
-
-        Notes
-        -----
-        * The texture-SLaT sampler runs guidance_strength=1.0 (no CFG), so
-          adaptive_cfg is an automatic no-op there; HiCache still applies.
-        * Sampler config knobs (e.g. ``hicache_interval``, ``hicache_sigma``,
-          ``acfg_gamma_bar``) can be set on the returned sampler instances.
+        It carves the SLaT stage gently (10%) over a Hermite SS forecast that always computes
+        the first six sparse-structure steps — where occupancy / topology is decided — so the
+        forecast cannot corrupt the volume and the acceleration stays lossless against the
+        base model. Mesh + texture + 1024_cascade are unchanged; only per-step compute drops.
+        ``GF_CARVE_RATIO`` / ``GF_HICACHE_SS_INTERVAL`` / ``GF_HICACHE_FIRST_ENHANCE`` override
+        the defaults for tuning.
         """
-        HICACHE = "FlowEulerGuidanceIntervalSampler_hicache"
-        ACFG = "FlowEulerGuidanceIntervalSampler_adaptivecfg"
-        FASTER = "FlowEulerGuidanceIntervalSampler_faster"
-        VANILLA = "FlowEulerGuidanceIntervalSampler"
-
-        # Per-stage class names: (sparse_structure, shape_slat, tex_slat).
-        # full_stack pins SS to HiCache-only to avoid the adaptive_cfg
-        # empty-mesh collapse on rounded objects (see docstring).
-        stage_map = {
-            "hicache": (HICACHE, HICACHE, HICACHE),
-            "faster": (HICACHE, HICACHE, HICACHE),
-            "full_stack": (HICACHE, FASTER, FASTER),
-            "adaptive_cfg": (ACFG, ACFG, ACFG),
-            "adaptivecfg": (ACFG, ACFG, ACFG),
-            "vanilla": (VANILLA, VANILLA, VANILLA),
-            None: (VANILLA, VANILLA, VANILLA),
-        }
-        if mode not in stage_map:
-            raise ValueError(
-                f"enable_faster: unknown mode {mode!r}; "
-                f"choose from {sorted(k for k in stage_map if k)}")
-
+        import os
         stages = ("sparse_structure_sampler", "shape_slat_sampler", "tex_slat_sampler")
-        for name, cls_name in zip(stages, stage_map[mode]):
+        if mode in ("base", "none", "off", None):
+            for name in stages:
+                old = getattr(self, name)
+                setattr(self, name, samplers.FlowEulerGuidanceIntervalSampler(sigma_min=old.sigma_min))
+            self.faster_mode = "base"
+            print("[hermit-trellis2] acceleration = base", flush=True)
+            return self
+
+        self.faster_mode = "hermite"
+        names = ("FlowEulerGuidanceIntervalSampler_hicache",
+                 "FlowEulerGuidanceIntervalSampler_carved",
+                 "FlowEulerGuidanceIntervalSampler_carved")
+        for name, cls_name in zip(stages, names):
             old = getattr(self, name)
             setattr(self, name, getattr(samplers, cls_name)(sigma_min=old.sigma_min))
 
-        self.faster_mode = mode if mode else "vanilla"
-        if mode == "full_stack":
-            print("[faster-trellis2] acceleration mode = full_stack "
-                  "(SS=HiCache-only for robustness; SLaT=HiCache+adaptive_cfg). "
-                  "NOTE: opt-in max-quality mode; see README empty-mesh caveat.")
-        else:
-            print(f"[faster-trellis2] acceleration mode = {self.faster_mode}")
+        # One shipped configuration: gentle 10% SLaT carving over a Hermite SS forecast that
+        # always computes the first six sparse-structure steps (where occupancy/topology is
+        # decided), so the forecast can't corrupt the volume — lossless against the base model.
+        carve = float(os.environ.get("GF_CARVE_RATIO", 0.10))
+        ss_interval = int(os.environ.get("GF_HICACHE_SS_INTERVAL", 2))
+        first_enhance = int(os.environ.get("GF_HICACHE_FIRST_ENHANCE", 6))
+        ss = self.sparse_structure_sampler
+        ss.hicache_interval = ss_interval
+        ss.hicache_first_enhance = first_enhance
+        for s in (self.shape_slat_sampler, self.tex_slat_sampler):
+            s.carving_ratio = carve
+
+        self._apply_hicache_toggles()
+        print(f"[hermit-trellis2] acceleration = hermite "
+              f"(carve={carve}, ss_interval={ss_interval}, first_enhance={first_enhance})", flush=True)
         return self
+
+    # Toggle attribute names recognised on each sampler stage. Stage-scoped via
+    # an optional "ss_"/"slat_" prefix in the cfg (e.g. "ss_hicache_interval"),
+    # else applied to all stages. SS-only safety acceleration (improvement (4))
+    # is just a stage-scoped interval/calibrate bump on the SS sampler.
+    _HICACHE_TOGGLE_KEYS = (
+        "hicache_interval", "hicache_max_order", "hicache_first_enhance",
+        "hicache_sigma", "hicache_order_sigma_retune",
+        "hicache_calibrate", "hicache_calibrate_weight",
+        "hicache_adaptive_schedule", "hicache_interval_min",
+        "hicache_interval_max", "hicache_adaptive_tol",
+        "hicache_freq_carve", "hicache_freq_strength",
+        "acfg_gamma_bar", "acfg_warmup", "acfg_max_order", "acfg_reuse_guidance",
+        "acfg_hermite", "acfg_hermite_sigma", "acfg_hermite_calibrate_weight",
+        "acfg_gamma_bar_schedule",
+    )
+
+    def _apply_hicache_toggles(self, cfg: dict = None) -> None:
+        """Set improvement-toggle attributes on the swapped sampler instances.
+
+        Config source order: the explicit ``cfg`` arg, else the JSON in
+        ``GAUSSIANFEELS_HICACHE_CFG``. Keys are toggle names (see
+        ``_HICACHE_TOGGLE_KEYS``); an optional ``ss_`` / ``slat_`` prefix scopes
+        a key to the sparse-structure or the two SLaT stages respectively
+        (improvement (4): SS-only acceleration). Unknown keys are ignored.
+        """
+        if cfg is None:
+            raw = os.environ.get("GAUSSIANFEELS_HICACHE_CFG", "").strip()
+            if not raw:
+                return
+            try:
+                cfg = json.loads(raw)
+            except Exception as exc:        # noqa: BLE001
+                print(f"[hermit-trellis2] bad GAUSSIANFEELS_HICACHE_CFG ({exc}); ignored.")
+                return
+        if not isinstance(cfg, dict) or not cfg:
+            return
+
+        ss = [self.sparse_structure_sampler]
+        slat = [self.shape_slat_sampler, self.tex_slat_sampler]
+        alls = ss + slat
+        applied = []
+        for key, val in cfg.items():
+            if key.startswith("ss_"):
+                targets, base = ss, key[3:]
+            elif key.startswith("slat_"):
+                targets, base = slat, key[5:]
+            else:
+                targets, base = alls, key
+            if base not in self._HICACHE_TOGGLE_KEYS:
+                continue
+            for s in targets:
+                if hasattr(s, base):
+                    setattr(s, base, val)
+            applied.append(f"{key}={val}")
+        if applied:
+            print(f"[hermit-trellis2] hicache toggles: {', '.join(applied)}")
 
     def preprocess_image(self, input: Image.Image) -> Image.Image:
         """
@@ -228,6 +257,14 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         if has_alpha:
             output = input
         else:
+            if self.rembg_model is None:
+                raise RuntimeError(
+                    "preprocess_image: background removal requested for a "
+                    "non-RGBA input, but the rembg model is unavailable on this "
+                    "setup (its native deps failed to load at from_pretrained). "
+                    "Pass an RGBA image whose alpha channel is the object mask, "
+                    "or call run(..., preprocess_image=False) with a pre-masked "
+                    "input.")
             input = input.convert('RGB')
             if self.low_vram:
                 self.rembg_model.to(self.device)
@@ -319,6 +356,25 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             decoded = torch.nn.functional.max_pool3d(decoded.float(), ratio, ratio, 0) > 0.5
         coords = torch.argwhere(decoded)[:, [0, 2, 3, 4]].int()
 
+        # (5) frequency-aware token carving: if the shape-SLaT sampler has
+        # hicache_freq_carve enabled, score the SAME post-maxpool occupancy grid
+        # (identical argwhere ordering -> rows align 1:1 with coords) and stash
+        # the per-token high-frequency weight for the LR shape-SLaT trajectory.
+        # Default-OFF; computed only when the toggle is set.
+        self._ss_freq_weight = None
+        # Needed by hicache_freq_carve (quality blend) AND by the carved SLaT
+        # sampler (token-selection signal). Compute when either is in play.
+        _want_freq = (getattr(self.shape_slat_sampler, "hicache_freq_carve", False)
+                      or getattr(self.shape_slat_sampler, "set_coords_scores", None) is not None)
+        if _want_freq:
+            try:
+                fw = ss_high_freq_weight(decoded.float(), coords, filter_radius=8)
+            except Exception as exc:        # noqa: BLE001
+                print(f"[hermit-trellis2] freq scoring failed ({exc}); disabled.")
+                fw = None
+            if fw is not None and fw.shape[0] == coords.shape[0]:
+                self._ss_freq_weight = fw
+
         return coords
 
     def sample_shape_slat(
@@ -342,6 +398,15 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             coords=coords,
         )
         sampler_params = {**self.shape_slat_sampler_params, **sampler_params}
+        # (5) inject SS-stage per-token high-frequency weight (coords match SS
+        # coords 1:1 in the non-cascade shape-SLaT path); no-op if off/unset.
+        if getattr(self.shape_slat_sampler, "set_freq_weight", None) is not None:
+            self.shape_slat_sampler.set_freq_weight(getattr(self, "_ss_freq_weight", None))
+        # Carved SLaT sampler: same per-token high-freq score is its token-
+        # selection signal (coords_scores[:,0]); coords align with SLaT tokens 1:1.
+        if getattr(self.shape_slat_sampler, "set_coords_scores", None) is not None:
+            _fw = getattr(self, "_ss_freq_weight", None)
+            self.shape_slat_sampler.set_coords_scores(_fw.reshape(-1, 1) if _fw is not None else None)
         if self.low_vram:
             flow_model.to(self.device)
         slat = self.shape_slat_sampler.sample(
@@ -358,9 +423,9 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         std = torch.tensor(self.shape_slat_normalization['std'])[None].to(slat.device)
         mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(slat.device)
         slat = slat * std + mean
-        
+
         return slat
-    
+
     def sample_shape_slat_cascade(
         self,
         lr_cond: dict,
@@ -387,6 +452,17 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             coords=coords,
         )
         sampler_params = {**self.shape_slat_sampler_params, **sampler_params}
+        # (5) inject SS-stage per-token high-frequency weight: the LR cascade
+        # trajectory's tokens == SS coords 1:1, so freq-carve applies here. It is
+        # cleared before the HR (upsampled) trajectory below, where the coords
+        # are re-derived -- matching the original's "disable on cascade-upsample".
+        if getattr(self.shape_slat_sampler, "set_freq_weight", None) is not None:
+            self.shape_slat_sampler.set_freq_weight(getattr(self, "_ss_freq_weight", None))
+        # Carved SLaT sampler: same per-token high-freq score is its token-
+        # selection signal (coords_scores[:,0]); coords align with SLaT tokens 1:1.
+        if getattr(self.shape_slat_sampler, "set_coords_scores", None) is not None:
+            _fw = getattr(self, "_ss_freq_weight", None)
+            self.shape_slat_sampler.set_coords_scores(_fw.reshape(-1, 1) if _fw is not None else None)
         if self.low_vram:
             flow_model_lr.to(self.device)
         slat = self.shape_slat_sampler.sample(
@@ -424,7 +500,12 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                     print(f"Due to the limited number of tokens, the resolution is reduced to {hr_resolution}.")
                 break
             hr_resolution -= 128
-        
+
+        # (5) HR trajectory: coords were re-derived by the 4x upsample and no
+        # longer align with the SS occupancy grid -> disable freq-carve here.
+        if getattr(self.shape_slat_sampler, "set_freq_weight", None) is not None:
+            self.shape_slat_sampler.set_freq_weight(None)
+
         # Sample structured latent
         noise = SparseTensor(
             feats=torch.randn(coords.shape[0], flow_model.in_channels).to(self.device),
