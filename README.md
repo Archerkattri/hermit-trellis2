@@ -8,6 +8,8 @@
 
 </div>
 
+> **HiCache++ variant:** an exponential (DMD/Prony) forecast variant of this repo lives in [`hermit-trellis2-plus-plus`](https://github.com/Archerkattri/hermit-trellis2-plus-plus) — same carved-hybrid, with the sparse-structure velocity forecast on a Dynamic-Mode-Decomposition basis instead of the Hermite polynomial.
+
 `hermit-trellis2` is `TRELLIS.2-4B` image-to-3D with a **training-free Hermite carved-hybrid** built
 into the flow-matching sampler. It forecasts the model's **final CFG-combined velocity** with a
 dual-scaled **Hermite** basis on the sparse-structure stage and **carves** the structured-latent
