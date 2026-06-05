@@ -10,6 +10,29 @@
 
 > **HiCache++ variant:** an exponential (DMD/Prony) forecast variant of this repo lives in [`hermit-trellis2-plus-plus`](https://github.com/Archerkattri/hermit-trellis2-plus-plus) — same carved-hybrid, with the sparse-structure velocity forecast on a Dynamic-Mode-Decomposition basis instead of the Hermite polynomial.
 
+## When to use this repo
+
+These repos are **complementary accelerators, not competing solutions** — each speeds up a *different*
+base generator, and the `+` / `++` suffix is a **method choice**, not a rival product. Pick by
+**(1) which base model you run**, then **(2) which forecast basis you want**:
+
+| base generator | `+` = HiCache (Hermite) | `++` = HiCache++ (DMD) |
+|---|---|---|
+| Hunyuan3D-2.1 | `hunyuan2.1-plus` | `hunyuan2.1-plus-plus` |
+| Hunyuan3D-2 mini | `hunyuan2-plus` | `hunyuan2-plus-plus` |
+| SAM 3D Objects | `sam3d-plus` | `sam3d-plus-plus` |
+| Fast-SAM3D | `fastsam3d-plus` | `fastsam3d-plus-plus` |
+| DiT-XL/2 (ImageNet) | `dit-plus` | `dit-plus-plus` |
+| TRELLIS (v1) | `faster-trellis` | `faster-trellis-plus-plus` |
+| TRELLIS.2-4B (v2) | `hermit-trellis2` | `hermit-trellis2-plus-plus` |
+
+- **`+` (HiCache / scaled-Hermite):** the *published* polynomial velocity-forecast basis — conservative, reproduces the HiCache paper. Use it to deploy the established method.
+- **`++` (HiCache++ / DMD exponential):** our Dynamic-Mode-Decomposition basis — *the same near-lossless quality at wider skip intervals*, where the polynomial diverges. Use it when you push the cache interval for more speed.
+- **standalone / model-agnostic:** [`hicache-plus-plus`](https://github.com/Archerkattri/hicache-plus-plus) — the forecaster itself, to add DMD caching to *your own* diffusion/flow model.
+- **`fast-trellis2`** = the TaylorSeer baseline fork (the upstream "Fast" accel) — the v2 reference point, not a HiCache variant.
+
+> **This repo:** `hermit-trellis2` — **TRELLIS.2-4B × HiCache (Hermite)** — carved-hybrid on the 4B v2 model.
+
 `hermit-trellis2` is `TRELLIS.2-4B` image-to-3D with a **training-free Hermite carved-hybrid** built
 into the flow-matching sampler. It forecasts the model's **final CFG-combined velocity** with a
 dual-scaled **Hermite** basis on the sparse-structure stage and **carves** the structured-latent
