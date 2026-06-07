@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="assets/banner.png" alt="hermit-trellis2" width="680">
+
 # 🧭 hermit-trellis2
 
 **Training-free Hermite-cached acceleration for [TRELLIS.2-4B](https://github.com/microsoft/TRELLIS) image-to-3D — ~1.9× fewer network evaluations, lossless, one line of code.**
