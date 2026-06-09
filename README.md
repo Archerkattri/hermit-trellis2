@@ -30,7 +30,7 @@ base generator, and the `+` / `++` suffix is a **method choice**, not a rival pr
 | Hunyuan3D-2 mini | `hunyuan2-plus` | `hunyuan2-plus-plus` |
 | SAM 3D Objects | `sam3d-plus` | `sam3d-plus-plus` |
 | Fast-SAM3D | `fastsam3d-plus` | `fastsam3d-plus-plus` |
-| DiT-XL/2 (ImageNet) | `dit-plus` | `dit-plus-plus` |
+| DiT-XL/2 (ImageNet) | `dit-plus` *(unreleased)* | `dit-plus-plus` *(unreleased)* |
 | TRELLIS (v1) | `faster-trellis` | `faster-trellis-plus-plus` |
 | TRELLIS.2-4B (v2) | `hermit-trellis2` | `hermit-trellis2-plus-plus` |
 
@@ -274,3 +274,12 @@ MIT. Accelerations © 2026 Krishi Attri; bundled TRELLIS.2 © Microsoft Corporat
 }
 ```
 </details>
+
+---
+
+## Family
+
+Part of the **HiCache++ acceleration family**.
+
+- **Family hub:** [`hicache-plus-plus`](https://github.com/Archerkattri/hicache-plus-plus) — the basis library behind this adapter.
+- **Sibling:** [`hermit-trellis2-plus-plus`](https://github.com/Archerkattri/hermit-trellis2-plus-plus) — the same base model with the HiCache++ (Dynamic Mode Decomposition / Prony) exponential-forecast variant.
