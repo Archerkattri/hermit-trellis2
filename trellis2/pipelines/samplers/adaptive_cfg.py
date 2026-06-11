@@ -170,7 +170,7 @@ def forecast_guidance_hermite(
         order += 1
 
     k = step - last_step          # forward horizon from the last anchor
-    x = float(-k)
+    x = float(k)
     result = diffs[0]
     for i in range(1, len(diffs)):
         result = result + (diffs[i] / math.factorial(i)) * scaled_hermite_scalar(i, x, sigma)
