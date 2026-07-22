@@ -4,6 +4,12 @@
 
 # 🧭 hermit-trellis2
 
+<p>
+  <a href="https://github.com/Archerkattri/hermit-trellis2/releases"><img alt="Release" src="https://img.shields.io/github/v/release/Archerkattri/hermit-trellis2?color=1f6feb"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/Archerkattri/hermit-trellis2?color=0d9488"></a>
+</p>
+
+
 **Training-free Hermite-cached acceleration for [TRELLIS.2-4B](https://github.com/microsoft/TRELLIS) image-to-3D — ~1.9× fewer network evaluations, lossless, one line of code.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](./LICENSE)
