@@ -60,6 +60,22 @@ from typing import Any, Dict, Optional
 import torch
 
 
+# Public compatibility surface for TRELLIS.2 integrations.  This checkout
+# ships the Hermite (polynomial) basis only; DMD lives in the sibling
+# hermit-trellis2-plus-plus repo.  The single-backend switch keeps lifecycle,
+# reset, and telemetry semantics identical across the two checkouts.
+HICACHE_BACKENDS = ("hermite",)
+
+
+def normalize_backend(backend: str) -> str:
+    """Return the supported forecast backend or raise a useful error."""
+    value = "hermite" if backend is None else str(backend).lower().strip()
+    if value not in HICACHE_BACKENDS:
+        choices = ", ".join(repr(item) for item in HICACHE_BACKENDS)
+        raise ValueError(f"HiCache backend must be one of {choices}, got {backend!r}")
+    return value
+
+
 # ---------------------------------------------------------------------------
 # Hermite basis
 # ---------------------------------------------------------------------------
@@ -119,6 +135,8 @@ def hicache_init(
     interval_min: Optional[int] = None,
     interval_max: Optional[int] = None,
     adaptive_tol: float = 0.05,
+    backend: str = "hermite",
+    stage: str = "unknown",
 ) -> Dict[str, Any]:
     """Create a fresh HiCache state dict for one sampling run.
 
@@ -138,6 +156,8 @@ def hicache_init(
     interval_min, interval_max : bounds for the adaptive interval (default to
         ``interval`` if unset, i.e. a no-op band).
     adaptive_tol : residual tolerance mapping smooth<->fast to the interval band.
+    backend : forecast basis; this checkout ships ``"hermite"`` only.
+    stage : telemetry label for the model stage owning this cache.
     """
     if interval < 1:
         raise ValueError("interval must be >= 1")
@@ -145,6 +165,7 @@ def hicache_init(
         raise ValueError("max_order must be >= 1")
     if not (0.0 < sigma < 1.0):
         raise ValueError(f"sigma must be in (0, 1), got {sigma}")
+    backend = normalize_backend(backend)
     imin = int(interval_min) if interval_min is not None else int(interval)
     imax = int(interval_max) if interval_max is not None else int(interval)
     return {
@@ -158,6 +179,8 @@ def hicache_init(
         "interval_min": max(imin, 1),
         "interval_max": max(imax, max(imin, 1)),
         "adaptive_tol": float(adaptive_tol),
+        "backend": backend,       # "hermite" (polynomial HiCache)
+        "stage": str(stage),      # telemetry only; the carved SLaT path is separate
         "last_residual": None,   # set by hicache_record_compute
         "step": 0,
         "counter": 0,            # forecasts since last compute
@@ -251,6 +274,17 @@ def hicache_forecast(state: Dict[str, Any]) -> torch.Tensor:
         result = result + coeff * scaled_hermite_scalar(order, x, sigma)
         order += 1
     return result
+
+
+def hicache_forecast_state(state: Dict[str, Any]) -> torch.Tensor:
+    """Forecast from the backend selected in ``state``.
+
+    This is the compatibility switch used by the sampler.  Keeping dispatch
+    here makes Hermite share lifecycle, reset, and telemetry semantics with
+    the sibling DMD checkout.
+    """
+    normalize_backend(state.get("backend", "hermite"))
+    return hicache_forecast(state)
 
 
 # ---------------------------------------------------------------------------

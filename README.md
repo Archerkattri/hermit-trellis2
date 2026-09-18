@@ -25,6 +25,13 @@
 
 > **HiCache++ variant:** an exponential (DMD/Prony) forecast variant of this repo lives in [`hermit-trellis2-plus-plus`](https://github.com/Archerkattri/hermit-trellis2-plus-plus) — same carved-hybrid, with the sparse-structure velocity forecast on a Dynamic-Mode-Decomposition basis instead of the Hermite polynomial.
 
+## Sampler integration
+
+![hermit-trellis2 sampler integration](assets/readme_flow.svg)
+
+Token carving and velocity forecasting are controlled separately. The Hermite backend acts only
+inside the TRELLIS.2 flow loop and reports compute, forecast, and fallback steps.
+
 ## When to use this repo
 
 These repos are **complementary accelerators, not competing solutions** — each speeds up a *different*
@@ -89,6 +96,8 @@ git clone https://github.com/Archerkattri/hermit-trellis2
 cd hermit-trellis2
 # TRELLIS.2 runtime deps (torch, flash-attn, spconv/flex_gemm, o-voxel, cumesh,
 # nvdiffrast) per microsoft/TRELLIS.2. Place / symlink weights at ckpts/TRELLIS.2-4B.
+# Deployment-contract runtime (budget/telemetry/manifest):
+pip install "hicache-pp @ git+https://github.com/Archerkattri/hicache-plus-plus@master"
 ```
 
 ```python
@@ -97,6 +106,7 @@ from PIL import Image
 
 pipe = Trellis2ImageTo3DPipeline.from_pretrained("ckpts/TRELLIS.2-4B").to("cuda")
 pipe.enable_faster()                                  # ← the only added line
+print(pipe.acceleration_status())                   # backend + per-stage report
 
 out  = pipe.run(Image.open("input_rgba.png"), pipeline_type="1024_cascade")
 mesh = out[0]
@@ -120,7 +130,12 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0 \
 
 ---
 
-## Results
+## Historical results (as measured)
+
+The following card is retained as prior-run evidence from the stated benchmark setup. It is not a
+current acceptance result and does not establish a universal speedup, losslessness, or quality
+ordering. Re-run the manifest command in `example_faster.py` on the target GPU before making a new
+claim.
 
 40 Toys4K objects, **RTX 5090**, TRELLIS.2-4B, full `1024_cascade` (mesh + texture), seed 42.
 Geometry is scored on the o-voxel mesh decoder with area-weighted surface sampling, after a

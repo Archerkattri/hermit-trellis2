@@ -158,7 +158,10 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             print("[hermit-trellis2] acceleration = base", flush=True)
             return self
 
-        self.faster_mode = "hermite"
+        mode = "hermite" if mode is None else str(mode).lower().strip()
+        if mode != "hermite":
+            raise ValueError("acceleration mode must be 'hermite' or 'base'")
+        self.faster_mode = mode
         names = ("FlowEulerGuidanceIntervalSampler_hicache",
                  "FlowEulerGuidanceIntervalSampler_carved",
                  "FlowEulerGuidanceIntervalSampler_carved")
@@ -175,13 +178,47 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         ss = self.sparse_structure_sampler
         ss.hicache_interval = ss_interval
         ss.hicache_first_enhance = first_enhance
+        ss.hicache_backend = mode
+        ss.hicache_stage = "sparse_structure"
         for s in (self.shape_slat_sampler, self.tex_slat_sampler):
             s.carving_ratio = carve
 
         self._apply_hicache_toggles()
-        print(f"[hermit-trellis2] acceleration = hermite "
+        print(f"[hermit-trellis2] acceleration = {mode} "
               f"(carve={carve}, ss_interval={ss_interval}, first_enhance={first_enhance})", flush=True)
         return self
+
+    def acceleration_status(self) -> dict:
+        """Describe the configured acceleration without claiming performance.
+
+        The sparse-structure backend is read from the live sampler so a
+        backwards-compatible post-``enable_faster`` assignment is represented
+        accurately.
+        """
+        mode = getattr(self, "faster_mode", "base")
+        ss = getattr(self, "sparse_structure_sampler", None)
+        if mode == "base":
+            return {
+                "enabled": False,
+                "mode": "base",
+                "backend": "none",
+                "stages": {
+                    "sparse_structure": "base",
+                    "shape_slat": "base",
+                    "texture_slat": "base",
+                },
+            }
+        backend = getattr(ss, "hicache_backend", mode)
+        return {
+            "enabled": True,
+            "mode": mode,
+            "backend": backend,
+            "stages": {
+                "sparse_structure": f"hicache:{backend}",
+                "shape_slat": "carved_slat",
+                "texture_slat": "carved_slat",
+            },
+        }
 
     # Toggle attribute names recognised on each sampler stage. Stage-scoped via
     # an optional "ss_"/"slat_" prefix in the cfg (e.g. "ss_hicache_interval"),

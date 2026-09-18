@@ -1,4 +1,8 @@
 from typing import *
+import copy
+import json
+import time
+import uuid
 import torch
 import numpy as np
 from tqdm import tqdm
@@ -242,10 +246,12 @@ from .hicache import (
     hicache_calibrate,
     hicache_record_compute,
     hicache_freq_blend,
+    hicache_forecast_state,
 )
 from . import adaptive_cfg as _acfg
 # Single sparse-tensor predicate, shared with AdaptiveCFGMixin (no duplicate).
 from .adaptive_cfg import is_sparse as _is_sparse
+from hicache_pp.budget import CacheBudget, CacheBudgetRuntime, RunIdentity, stable_digest
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +269,16 @@ class HiCacheMixin:
     hicache_max_order: int = 1
     hicache_first_enhance: int = 2
     hicache_sigma: float = 0.5
+    # forecast basis: "hermite" only in this checkout (DMD lives in the
+    # sibling hermit-trellis2-plus-plus repo).
+    hicache_backend: str = "hermite"
+    hicache_stage: str = "unknown"
+    # Deployment envelope.  ``None`` keeps the historical schedule while the
+    # runtime still emits an identity-bound manifest with the default envelope.
+    hicache_budget = None
+    hicache_max_horizon: Optional[int] = None
+    hicache_max_memory_mb: Optional[float] = None
+    hicache_audit_budget: int = 0
 
     # --- improvement toggles (all default-OFF so shipped behaviour is unchanged) ---
     # (2) higher-order forecast: hicache_max_order in {1,2,3}; when
@@ -282,6 +298,16 @@ class HiCacheMixin:
     hicache_freq_strength: float = 0.8
     # per-token high-frequency weight (N,) injected from the SS stage; None=off.
     _hicache_freq_weight = None
+
+    def configure_hicache_budget(self, budget=None, *, max_horizon: Optional[int] = None,
+                                 max_memory_mb: Optional[float] = None,
+                                 audit_budget: int = 0):
+        """Set the explicit quality/latency/memory envelope for future runs."""
+        self.hicache_budget = budget
+        self.hicache_max_horizon = max_horizon
+        self.hicache_max_memory_mb = max_memory_mb
+        self.hicache_audit_budget = audit_budget
+        return self
 
     def set_freq_weight(self, freq_weight) -> None:
         """Inject the SS-stage per-token high-frequency weight (N,) in [0,1].
@@ -304,6 +330,10 @@ class HiCacheMixin:
         by ``_hicache_setup`` at the start of every run, so this does not affect
         the output.
         """
+        runtime = getattr(self, "_budget_runtime", None)
+        if runtime is not None:
+            self._last_hicache_manifest = runtime.manifest.as_dict()
+        self._budget_runtime = None
         self._hicache = None
         self._hicache_freq_weight = None
         parent = getattr(super(), "_release_accel_state", None)
@@ -339,6 +369,23 @@ class HiCacheMixin:
         if self.hicache_order_sigma_retune and self.hicache_max_order >= 2:
             sigma = sigma * (0.7 ** (self.hicache_max_order - 1))
             sigma = max(sigma, 0.15)
+        budget = self.hicache_budget
+        if budget is None:
+            budget = CacheBudget(
+                backend=self.hicache_backend,
+                allowed_stages=(self.hicache_stage,),
+                max_horizon=max(1, int(interval) - 1)
+                if self.hicache_max_horizon is None else self.hicache_max_horizon,
+                quality_preset="adapter-default",
+                max_memory_mb=self.hicache_max_memory_mb,
+                audit_budget=self.hicache_audit_budget,
+                fallback="full",
+            )
+        elif not isinstance(budget, CacheBudget):
+            budget = CacheBudget.from_mapping(budget)
+        self._hicache_budget = budget
+        self._budget_runtime = None
+        self._last_hicache_manifest = None
         self._hicache = hicache_init(
             num_steps=steps,
             interval=interval,
@@ -350,7 +397,80 @@ class HiCacheMixin:
             interval_min=imin,
             interval_max=imax,
             adaptive_tol=self.hicache_adaptive_tol,
+            backend=self.hicache_backend,
+            stage=self.hicache_stage,
         )
+
+    def _ensure_budget_runtime(self, model, x_t, cond) -> CacheBudgetRuntime:
+        runtime = getattr(self, "_budget_runtime", None)
+        if runtime is not None:
+            return runtime
+        state = self._hicache
+        state.setdefault("run_id", uuid.uuid4().hex)
+        model_id = f"{type(model).__module__}.{type(model).__qualname__}"
+        schedule = {
+            "num_steps": int(state["num_steps"]),
+            "interval": int(state["interval"]),
+            "first_enhance": int(state["first_enhance"]),
+            "end_enhance": int(state["end_enhance"]),
+            "backend": str(state["backend"]),
+            "stage": str(self.hicache_stage),
+        }
+        condition_shape = tuple(getattr(cond, "shape", ()))
+        token_shape = tuple(getattr(getattr(x_t, "feats", x_t), "shape", ()))
+        identity = RunIdentity(
+            model_id=model_id,
+            run_id=state["run_id"],
+            schedule_digest=stable_digest(schedule),
+            cfg_branch="cfg-combined",
+            conditioning_id=stable_digest({"condition_shape": condition_shape}),
+            stage=str(self.hicache_stage),
+            token_layout_digest=stable_digest({"token_shape": token_shape}),
+            dtype=str(getattr(x_t, "dtype", "")),
+            device=str(getattr(x_t, "device", "")),
+        )
+        self._budget_runtime = CacheBudgetRuntime(
+            self._hicache_budget,
+            identity,
+            model_digest=stable_digest({"model_id": model_id}),
+            config_digest=stable_digest({"budget": self._hicache_budget.as_dict(), "schedule": schedule}),
+            input_digest=stable_digest({"token_shape": token_shape, "condition_shape": condition_shape}),
+        )
+        return self._budget_runtime
+
+    @staticmethod
+    def _budget_memory_mb(value) -> Optional[float]:
+        value = getattr(value, "feats", value)
+        try:
+            return float(value.numel() * value.element_size()) / (1024.0 * 1024.0)
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    def hicache_status(self) -> dict:
+        """Return the selected backend/stage and current cache counters.
+
+        The status is deliberately descriptive only: it never infers quality
+        or speed from configuration.  ``backend`` is the actual state selected
+        by the compatibility switch after setup, while ``stage`` identifies
+        the model stage that owns this cache.
+        """
+        state = getattr(self, "_hicache", None)
+        if state is None:
+            return {
+                "enabled": False,
+                "backend": "none",
+                "stage": str(getattr(self, "hicache_stage", "unknown")),
+                "full_steps": 0,
+                "forecast_steps": 0,
+            }
+        full_steps = len(state.get("activated_steps", ()))
+        return {
+            "enabled": True,
+            "backend": state.get("backend", self.hicache_backend),
+            "stage": state.get("stage", self.hicache_stage),
+            "full_steps": full_steps,
+            "forecast_steps": max(int(state.get("step", 0)) - full_steps, 0),
+        }
 
     @torch.no_grad()
     def sample_once(self, model, x_t, t, t_prev, cond=None, **kwargs):
@@ -358,9 +478,31 @@ class HiCacheMixin:
         if state is None:
             return super().sample_once(model, x_t, t, t_prev, cond, **kwargs)
 
-        decision = hicache_decide(state)
+        scheduled = hicache_decide(state)
+        runtime = self._ensure_budget_runtime(model, x_t, cond)
+        forecast_requested = scheduled == "forecast"
+        budget_decision = runtime.decide(
+            str(self.hicache_stage),
+            horizon=max(1, int(state.get("counter", 0))) if forecast_requested else 0,
+            method=runtime.budget.backend,
+            supported=True,
+            memory_mb=self._budget_memory_mb(x_t),
+            force_full=(not forecast_requested or runtime.budget.backend == "full"),
+            audit=forecast_requested and runtime.audits_remaining > 0,
+            controller_selected=True,
+        )
+        serve_forecast = forecast_requested and budget_decision.mode == "forecast"
+        if forecast_requested and not serve_forecast:
+            # hicache_decide has already advanced its skip counter.  A guard or
+            # budgeted audit becomes a fresh anchor at this diffusion index.
+            state["type"] = "full"
+            state["counter"] = 0
+            if not state["activated_steps"] or state["activated_steps"][-1] != state["step"]:
+                state["activated_steps"].append(state["step"])
 
-        if decision == "full":
+        work_started = time.perf_counter()
+
+        if not serve_forecast:
             # eps branch is unused on this path; take x_0 and v only.
             pred_x_0, _, pred_v = self._get_model_prediction(model, x_t, t, cond, **kwargs)
             feats = pred_v.feats if _is_sparse(pred_v) else pred_v
@@ -373,6 +515,10 @@ class HiCacheMixin:
                 hicache_record_compute(state, feats)
             hicache_update_derivatives(state, feats)
             state["step"] += 1
+            runtime.record_measurement(
+                str(self.hicache_stage), "full",
+                wall_time_ms=(time.perf_counter() - work_started) * 1000.0,
+            )
             pred_x_prev = x_t - (t - t_prev) * pred_v
             return edict({"pred_x_prev": pred_x_prev, "pred_x_0": pred_x_0})
 
@@ -381,7 +527,7 @@ class HiCacheMixin:
         # it directly (avoids recomputing the discarded eps branch on the
         # SparseTensor each forecast step). Numerically identical to
         # _v_to_xstart_eps(...)[0].
-        feats_hat = hicache_forecast(state)
+        feats_hat = hicache_forecast_state(state)
         # (1) FoCa-style Heun calibration: shrink the over-confident forecast
         # toward the last trusted anchor (reuses cached derivatives; zero evals).
         if self.hicache_calibrate:
@@ -405,7 +551,29 @@ class HiCacheMixin:
         pred_x_0 = self._pred_to_xstart(x_t, t, pred_v)
         pred_x_prev = x_t - (t - t_prev) * pred_v
         state["step"] += 1
+        runtime.record_measurement(
+            str(self.hicache_stage), state.get("backend", "hermite"),
+            wall_time_ms=(time.perf_counter() - work_started) * 1000.0,
+        )
         return edict({"pred_x_prev": pred_x_prev, "pred_x_0": pred_x_0})
+
+    def get_hicache_manifest(self):
+        """Return the latest portable budget/identity manifest."""
+        manifest = getattr(self, "_last_hicache_manifest", None)
+        if manifest is None:
+            runtime = getattr(self, "_budget_runtime", None)
+            manifest = runtime.manifest.as_dict() if runtime is not None else None
+        return copy.deepcopy(manifest) if manifest is not None else None
+
+    def save_hicache_manifest(self, destination):
+        """Write the latest manifest without tensors, prompts or local paths."""
+        manifest = self.get_hicache_manifest()
+        if manifest is None:
+            raise RuntimeError("no completed HiCache run is available")
+        with open(destination, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, indent=2, sort_keys=True, allow_nan=False)
+            handle.write("\n")
+        return destination
 
 
 # ---------------------------------------------------------------------------
