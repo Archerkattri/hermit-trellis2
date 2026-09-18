@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hermit-trellis2 — Training-free Hermite-cached acceleration for TRELLIS.2-4B image-to-3D</title>
+<meta name="description" content="Training-free Hermite carved-hybrid for TRELLIS.2-4B image-to-3D: it forecasts the final CFG-combined velocity with a dual-scaled Hermite basis on the sparse-structure stage and carves structured-latent tokens. Weights, decoders and the full 1024_cascade mesh + texture are left untouched.">
+<style>
+  :root{
+    --bg:#ffffff; --ink:#17202a; --muted:#5a6572; --line:#e3e8ee;
+    --accent:#0c52d6; --accent-ink:#0c52d6; --code-bg:#f4f6f8; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+    font-size:16px;line-height:1.6}
+  .wrap{max-width:860px;margin:0 auto;padding:0 22px}
+  a{color:var(--accent);text-decoration:none}
+  a:hover{text-decoration:underline}
+  /* top bar */
+  .top{border-bottom:1px solid var(--line)}
+  .top .wrap{display:flex;align-items:baseline;gap:14px;padding-top:14px;padding-bottom:14px;flex-wrap:wrap}
+  .top .repo{font-weight:700;font-size:17px;color:var(--ink)}
+  .top .repo a{color:var(--ink)}
+  .top .ver{font-family:var(--mono);font-size:12px;color:var(--muted);border:1px solid var(--line);padding:1px 8px;border-radius:20px}
+  .top nav{margin-left:auto;display:flex;gap:16px;font-size:14px}
+  /* hero */
+  .hero{padding:34px 0 8px}
+  .hero img.banner{width:100%;height:auto;border:1px solid var(--line);display:block}
+  .hero h1{font-size:30px;line-height:1.25;margin:22px 0 6px;letter-spacing:-0.01em}
+  .hero p.lede{color:var(--muted);margin:0 0 14px;max-width:62ch}
+  pre{background:var(--code-bg);border:1px solid var(--line);padding:12px 14px;overflow-x:auto;
+    font-family:var(--mono);font-size:13px;line-height:1.55;margin:0 0 8px}
+  pre .c{color:#6a737d}
+  /* sections */
+  section{padding:26px 0 6px;border-top:1px solid var(--line);margin-top:26px}
+  section:first-of-type{border-top:0}
+  .sec-head{display:flex;align-items:baseline;gap:12px;margin-bottom:12px}
+  .sec-num{font-family:var(--mono);font-size:13px;color:var(--accent-ink);font-weight:700}
+  .sec-head h2{font-size:20px;margin:0}
+  table.ev{width:100%;border-collapse:collapse;font-size:14px}
+  table.ev th,table.ev td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  table.ev th{color:var(--muted);font-weight:600;width:34%}
+  table.ev td b{font-variant-numeric:tabular-nums}
+  .ok{color:#0a7b3c;font-weight:700}
+  .gallery{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .gallery figure{margin:0;border:1px solid var(--line)}
+  .gallery img,.gallery video{width:100%;height:auto;display:block}
+  .gallery figcaption{font-size:13px;color:var(--muted);padding:8px 10px;border-top:1px solid var(--line)}
+  .limits{background:#fbfcfd;border:1px solid var(--line);padding:14px 16px;font-size:14px}
+  .limits ul{margin:8px 0 0;padding-left:20px}
+  .limits li{margin:4px 0}
+  footer{border-top:1px solid var(--line);margin-top:30px;padding:16px 0 30px;color:var(--muted);font-size:13px}
+  footer .wrap{display:flex;gap:16px;flex-wrap:wrap}
+  @media (max-width:640px){.gallery{grid-template-columns:1fr}.hero h1{font-size:24px}}
+</style>
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <span class="repo"><a href="https://github.com/Archerkattri/hermit-trellis2">hermit-trellis2</a></span>
+  <span class="ver">0.1.1</span>
+  <nav><a href="https://github.com/Archerkattri/hermit-trellis2">Code</a><a href="https://github.com/Archerkattri/hermit-trellis2/releases/tag/v0.1.1">Release</a></nav>
+</div></header>
+<main class="wrap">
+  <div class="hero">
+    <img class="banner" src="assets/banner.png" alt="hermit-trellis2 banner">
+    <h1>Hermite-cached acceleration for TRELLIS.2 image-to-3D</h1>
+    <p class="lede">Training-free Hermite carved-hybrid for TRELLIS.2-4B image-to-3D: it forecasts the final CFG-combined velocity with a dual-scaled Hermite basis on the sparse-structure stage and carves structured-latent tokens. Weights, decoders and the full 1024_cascade mesh + texture are left untouched.</p>
+    <pre>git clone https://github.com/Archerkattri/hermit-trellis2
+cd hermit-trellis2
+<span class="c"># TRELLIS.2 runtime deps (torch, flash-attn, spconv/flex_gemm, o-voxel, cumesh,</span>
+<span class="c"># nvdiffrast) per microsoft/TRELLIS.2. Place / symlink weights at ckpts/TRELLIS.2-4B.</span>
+<span class="c"># Deployment-contract runtime (budget/telemetry/manifest):</span>
+pip install "hicache-pp @ git+https://github.com/Archerkattri/hicache-plus-plus@master"</pre>
+  </div>
+  <section><div class="sec-head"><span class="sec-num">01</span><h2>Evidence</h2></div>
+    <table class="ev"><tr><th>End-to-end speedup</th><td><b>1.88×</b> (6.26 s vs 11.75 s base, RTX 5090, full 1024_cascade)</td></tr><tr><th>F1@0.05 mean</th><td><b>0.869</b> vs base 0.860 (TaylorSeer sibling 0.900)</td></tr><tr><th>F1 median</th><td><b>0.957</b> vs base 0.932</td></tr><tr><th>Chamfer distance</th><td><b>0.059</b> vs base 0.057, within run-to-run noise</td></tr><tr><th>Benchmark scope</th><td><b>35 of 40</b> Toys4K objects completed by all three rows, seed 42</td></tr><tr><th>SS forecast interval</th><td>compute 1 step, forecast <b>1</b> (GF_HICACHE_SS_INTERVAL=2)</td></tr><tr><th>SLaT carve ratio</th><td><b>0.10</b> of tokens cached per step (GF_CARVE_RATIO)</td></tr><tr><th>SS first-enhance</th><td>first <b>6</b> steps always computed (GF_HICACHE_FIRST_ENHANCE)</td></tr></table>
+  </section>
+  <section><div class="sec-head"><span class="sec-num">02</span><h2>Media</h2></div>
+    <div class="gallery"><figure><img src="assets/teaser.webp" alt="hermit-trellis2 teaser"><figcaption>Teaser: image-to-3D output of the accelerated pipeline.</figcaption></figure><figure><img src="assets/readme_flow.svg" alt="sampler integration diagram"><figcaption>Sampler integration: Hermite forecast on sparse-structure, carving on SLaT.</figcaption></figure><figure><img src="assets/ex1.webp" alt="example input image 1"><figcaption>Example input image from assets/example_image.</figcaption></figure><figure><img src="assets/ex2.webp" alt="example input image 2"><figcaption>Example input image from assets/example_image.</figcaption></figure></div>
+  </section>
+  <section><div class="sec-head"><span class="sec-num">03</span><h2>Install &amp; verify</h2></div>
+    <pre><span class="c"># 5 CPU contract tests (CI job cpu-contract: torch CPU + hicache-pp master)</span>
+python tests/test_hicache_contract.py
+<span class="c"># expected: 5 x [PASS]</span></pre>
+  </section>
+  <section><div class="sec-head"><span class="sec-num">04</span><h2>Limits</h2></div>
+    <div class="limits"><p style="margin:0">What this release does <b>not</b> claim (from the release notes):</p><ul><li>The historical-results card “is not a current acceptance result and does not establish a universal speedup, losslessness, or quality ordering.”</li><li>“Re-run the manifest command in <code>example_faster.py</code> on the target GPU before making a new claim.”</li><li>“The published numbers above were measured with the as-released code and remain valid as-measured; re-validation on this model is pending.”</li></ul></div>
+  </section>
+</main>
+<footer><div class="wrap"><span>MIT · © 2026 Krishi Attri</span><span></span><span style="margin-left:auto"><a href="https://github.com/Archerkattri/hermit-trellis2">hermit-trellis2</a></span></div></footer>
+</body>
+</html>
