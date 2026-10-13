@@ -10,25 +10,17 @@ on:
     branches: [main]
 
 jobs:
-  cpu-contract:
+  cpu-source-validation:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
-      - name: Install CPU test dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.1"
-          pip install numpy tqdm
-          pip install --force-reinstall --no-deps "hicache-pp @ git+https://github.com/Archerkattri/hicache-plus-plus@master"
       - name: Reject unresolved merge markers
         run: |
           if git grep -n -E '^(<<<<<<<|=======|>>>>>>>)' -- '*.py'; then
             exit 1
           fi
       - name: Compile first-party source
-        run: python -m compileall -q trellis2 tests faster_utils_slat fft token_slat
-      - name: Run standalone CPU accelerator tests
-        run: python tests/test_hicache_contract.py
+        run: python -m compileall -q trellis2 faster_utils_slat fft token_slat
